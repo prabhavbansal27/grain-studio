@@ -30,6 +30,26 @@ PLATE_SS = 0.0
 TARGET_SIGMA = 8.0
 SIZES = {"native": 1, "1.5x": 1.5, "2x": 2, "3x": 3}
 
+# Community Cloud's free tier caps a container at ~1GB RAM. Every allocation
+# below that holds a run of decoded frames is sized off a byte budget rather
+# than a flat frame count, so it scales itself down automatically at higher
+# resolutions instead of silently exceeding that limit. Frame count is not a
+# constant memory cost — a "3 second window" is ~20x heavier at 4K than at
+# 480p — which is what the flat-frame-count version of this got wrong.
+PREVIEW_BUDGET = 60 * 1024 * 1024       # source preview window (session-local)
+PLATE_CAL_BUDGET = 16 * 1024 * 1024     # plate calibration window (process-wide cache)
+EXPORT_CHUNK_BUDGET = 16 * 1024 * 1024  # per-chunk transient buffers during export
+
+
+def frames_for_budget(budget, w, h, min_frames, max_frames=None):
+    """How many w×h yuv420p frames fit in `budget` bytes, clamped to
+    [min_frames, max_frames]. One frame already spatially averages over
+    w*h pixels, so even a small min_frames gives a stable grain statistic —
+    the floor exists for motion-check duration, not statistical accuracy.
+    """
+    n = max(min_frames, budget // frame_size(w, h))
+    return int(min(n, max_frames)) if max_frames else int(n)
+
 
 # ---- ffmpeg / numpy pipeline (ported from the local tool's app.py) ------
 
@@ -84,7 +104,7 @@ def pack(y, u, v):
 
 
 def decode_window(path, ss, n, w, h, vf=None):
-    args = ["ffmpeg", "-v", "error", "-ss", str(ss), "-i", path]
+    args = ["ffmpeg", "-v", "error", "-threads", "2", "-ss", str(ss), "-i", path]
     if vf:
         args += ["-vf", vf]
     args += ["-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]
@@ -99,17 +119,77 @@ def decode_window(path, ss, n, w, h, vf=None):
     return buf[:got * fsz].reshape(got, fsz)
 
 
+def mean_std(arr):
+    """Mean/std of a uint8 array without ndarray.std()'s internal
+    (x - x.mean())**2 step — that materializes a full-size float64
+    temporary (8 bytes/pixel vs. 1 for uint8), which alone cost ~265MB
+    on a 4-frame 4K calibration window. Summing in bounded sub-chunks
+    keeps the temporary's size constant regardless of the array's.
+    """
+    flat = arr.reshape(-1)
+    n = flat.size
+    mean = float(flat.sum(dtype=np.float64) / n)
+    ss = 0.0
+    step = 4_000_000
+    for i in range(0, n, step):
+        chunk = flat[i:i + step].astype(np.float64)
+        chunk -= mean
+        ss += float(np.dot(chunk, chunk))
+    return mean, (ss / n) ** 0.5
+
+
 def weight(y):
-    t = np.clip((y - 16.0) / 219.0, 0.0, 1.0)
-    return np.maximum(0.18, np.sqrt(4.0 * t * (1.0 - t)))
+    t = y.astype(np.float32)
+    t -= 16.0
+    t *= (1.0 / 219.0)
+    np.clip(t, 0.0, 1.0, out=t)
+    u = 1.0 - t
+    t *= u
+    t *= 4.0
+    np.sqrt(t, out=t)
+    np.maximum(t, 0.18, out=t)
+    return t
+
+
+COMPOSITE_CHUNK_BYTES = 12 * 1024 * 1024  # bounds peak working-set regardless of batch size
 
 
 def composite(sy, py, mean, sigma, k, weighted):
-    dev = (py.astype(np.float32) - mean) * (TARGET_SIGMA * k / sigma)
+    """Grain compositor. Chunks internally over the frame axis so a
+    caller handing this a big multi-frame batch (a "preview clip" render,
+    an export chunk) can't blow past this function's own memory bound —
+    the float32 working arrays inside used to scale with whatever batch
+    size the caller happened to pass, uncapped.
+    """
+    if sy.ndim == 2:
+        return _composite_batch(sy, py, mean, sigma, k, weighted)
+    n = sy.shape[0]
+    frame_bytes = sy[0].nbytes
+    chunk = max(1, COMPOSITE_CHUNK_BYTES // frame_bytes)
+    if chunk >= n:
+        return _composite_batch(sy, py, mean, sigma, k, weighted)
+    out = np.empty(sy.shape, dtype=np.uint8)
+    for i in range(0, n, chunk):
+        out[i:i + chunk] = _composite_batch(sy[i:i + chunk], py[i:i + chunk], mean, sigma, k, weighted)
+    return out
+
+
+def _composite_batch(sy, py, mean, sigma, k, weighted):
+    # weight(sy) is computed — and its own internal scratch buffer freed —
+    # BEFORE dev is allocated. Doing it in the other order (as an earlier
+    # version of this did) keeps three same-shape float32 buffers alive
+    # at once instead of two; that alone roughly doubled peak memory here.
+    w = weight(sy) if weighted else None
+    dev = py.astype(np.float32)
+    dev -= np.float32(mean)
+    dev *= np.float32(TARGET_SIGMA * k / sigma)
     if weighted:
-        dev *= weight(sy.astype(np.float32))
-    raw = sy.astype(np.float32) + dev
-    return np.clip(np.rint(raw), 0, 255).astype(np.uint8)
+        dev *= w
+        del w
+    dev += sy
+    np.clip(dev, 0, 255, out=dev)
+    np.rint(dev, out=dev)
+    return dev.astype(np.uint8)
 
 
 def plate_geometry(preset, w, h):
@@ -128,15 +208,23 @@ def plate_geometry(preset, w, h):
     return f"crop={cw}:{ch}:{cx}:{cy},scale={w}:{h}:flags=bicubic"
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=2)
 def get_plate(preset, w, h):
     """Decode+cache a calibration window of the plate for (preset,w,h).
     Same stats feed preview and export, so what you tune matches what ships.
+
+    max_entries=2 matters as much as the byte budget: this cache is
+    process-wide (shared across every session) and never expired on its
+    own, so trying a couple of grain-size presets without a cap would keep
+    every one of them resident — that's what actually exhausted the 1GB
+    container, not any single allocation.
     """
     vf = plate_geometry(preset, w, h)
-    buf = decode_window(PLATE, PLATE_SS, 64, w, h, vf=f"{vf},format=yuv420p")
+    n = frames_for_budget(PLATE_CAL_BUDGET, w, h, min_frames=4, max_frames=64)
+    buf = decode_window(PLATE, PLATE_SS, n, w, h, vf=f"{vf},format=yuv420p")
     py, _, _ = planes(buf, w, h)
-    return py, float(py.mean()), float(py.std())
+    mean, sigma = mean_std(py)
+    return py, mean, sigma
 
 
 def encode_png_bytes(frame, w, h):
@@ -151,38 +239,47 @@ def encode_png_bytes(frame, w, h):
 
 
 def export_full(path, info, preset, k, weighted, progress):
+    """Full-length export.
+
+    Draws grain content from get_plate()'s already-decoded, budget-capped
+    array (looped via modulo) instead of running a second live
+    `-stream_loop` ffmpeg process — that cut a whole concurrent ffmpeg
+    process out of export, which mattered more for staying inside
+    Community Cloud's 1GB container than any single buffer size did (see
+    the x264-params below for the other half of that fix: default x264
+    lookahead/reference-frame buffering alone was costing several hundred
+    MB per encoder instance at 4K). It also means preview and export now
+    draw from identical plate content, not just similarly-calibrated ones.
+    """
     w, h, fps = info["width"], info["height"], info["fps"]
     dur, has_audio = info["duration"], info["has_audio"]
-    vf = plate_geometry(preset, w, h)
-    _frames, mean, sigma = get_plate(preset, w, h)
+    py_all, mean, sigma = get_plate(preset, w, h)
+    plate_n = py_all.shape[0]
     total_frames = max(1, round(dur * fps))
 
     fd, out_path = tempfile.mkstemp(suffix="_grain.mp4")
     os.close(fd)
-    src_p = plate_p = enc_p = None
+    src_p = enc_p = None
     try:
         src_p = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo",
-             "-pix_fmt", "yuv420p", "-"], stdout=subprocess.PIPE)
-        plate_p = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-stream_loop", "-1", "-ss", str(PLATE_SS),
-             "-i", PLATE, "-vf", f"{vf},format=yuv420p", "-r", str(fps),
-             "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ["ffmpeg", "-v", "error", "-threads", "2", "-i", path,
+             "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"], stdout=subprocess.PIPE)
 
         enc_args = ["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
                     "-s", f"{w}x{h}", "-r", str(fps), "-i", "-"]
         if has_audio:
             enc_args += ["-i", path, "-map", "0:v:0", "-map", "1:a:0?"]
         enc_args += ["-c:v", "libx264", "-preset", "fast", "-tune", "grain",
-                     "-crf", "18", "-pix_fmt", "yuv420p"]
+                     "-crf", "18", "-pix_fmt", "yuv420p",
+                     "-x264-params", "rc-lookahead=10:ref=1:bframes=0",
+                     "-threads", "2"]
         if has_audio:
             enc_args += ["-c:a", "aac", "-b:a", "192k"]
         enc_args += ["-movflags", "+faststart", "-shortest", out_path, "-y"]
         enc_p = subprocess.Popen(enc_args, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
         fsz = frame_size(w, h)
-        chunk_frames = 8  # kept small — free-tier instances only get 1GB RAM
+        chunk_frames = frames_for_budget(EXPORT_CHUNK_BUDGET, w, h, min_frames=1, max_frames=8)
         done = 0
         while True:
             sbuf = read_exact(src_p.stdout, fsz * chunk_frames)
@@ -190,19 +287,9 @@ def export_full(path, info, preset, k, weighted, progress):
             if got == 0:
                 break
             sbuf = sbuf[:got * fsz]
-            pbuf = read_exact(plate_p.stdout, fsz * got)
-            pgot = len(pbuf) // fsz
             sarr = np.frombuffer(sbuf, dtype=np.uint8).reshape(got, fsz)
-            if pgot < got:
-                if pgot == 0:
-                    raise RuntimeError("grain plate stream ended unexpectedly")
-                parr = np.frombuffer(pbuf[:pgot * fsz], dtype=np.uint8).reshape(pgot, fsz)
-                parr = parr[np.arange(got) % pgot]
-            else:
-                parr = np.frombuffer(pbuf[:got * fsz], dtype=np.uint8).reshape(got, fsz)
-
             sy, su, sv = planes(sarr, w, h)
-            py, _, _ = planes(parr, w, h)
+            py = py_all[np.arange(done, done + got) % plate_n]
             oy = composite(sy, py, mean, sigma, k, weighted)
             enc_p.stdin.write(pack(oy, su, sv).tobytes())
 
@@ -214,13 +301,12 @@ def export_full(path, info, preset, k, weighted, progress):
         src_p.stdout.close()
         enc_p.stdin.close()
         src_p.wait(timeout=30)
-        plate_p.terminate()
         enc_err = enc_p.stderr.read()
         if enc_p.wait(timeout=180) != 0:
             raise RuntimeError(enc_err.decode(errors="replace")[-2000:])
         return out_path
     except Exception:
-        for p in (src_p, plate_p, enc_p):
+        for p in (src_p, enc_p):
             if p and p.poll() is None:
                 p.kill()
         raise
@@ -259,6 +345,22 @@ except Exception as e:
 st.caption(f"{info['width']}×{info['height']} · {info['fps']:.2f}fps · "
            f"{info['duration']:.1f}s" + (" · has audio" if info["has_audio"] else " · no audio"))
 
+# Measured directly (see the design conversation this shipped from): 1080p
+# exports stayed comfortably under Community Cloud's 1GB container limit
+# (peak concurrent memory across every process — the Python app plus every
+# concurrently-running ffmpeg process — measured 633-832MB across a couple
+# of real test clips); a 4K export measured 1339MB, well over it, mainly
+# from x264's own frame buffers at that resolution rather than anything
+# this app allocates. Rather than let a larger upload fail with a generic
+# crash, say so upfront.
+SAFE_PIXELS = 1920 * 1080
+if info["width"] * info["height"] > SAFE_PIXELS:
+    st.warning(
+        f"{info['width']}×{info['height']} is above the ~1080p ceiling this free "
+        "tier's 1GB memory limit can reliably handle for export (mainly the video "
+        "encoder's own buffers, not this app). It may still work, especially for "
+        "shorter clips — but if export fails, downscale the source first.")
+
 col_stage, col_controls = st.columns([2, 1], gap="large")
 
 with col_controls:
@@ -277,12 +379,17 @@ with col_stage:
     win_key = (video_path, round(t, 1))
     if st.session_state.get("win_key") != win_key:
         win_dur = min(3.0, max(0.5, dur - t)) if dur > 0 else 3.0
-        n = max(1, round(win_dur * info["fps"]))
+        n_wanted = max(1, round(win_dur * info["fps"]))
+        n = min(n_wanted, frames_for_budget(PREVIEW_BUDGET, info["width"], info["height"], min_frames=4))
         buf = decode_window(video_path, t, n, info["width"], info["height"])
         sy, su, sv = planes(buf, info["width"], info["height"])
         st.session_state["win_key"] = win_key
         st.session_state["window"] = dict(sy=sy, su=su, sv=sv, w=info["width"],
                                            h=info["height"], fps=info["fps"])
+
+    win_secs = st.session_state["window"]["sy"].shape[0] / st.session_state["window"]["fps"]
+    st.caption(f"Preview window: {win_secs:.2f}s "
+               f"({st.session_state['window']['sy'].shape[0]} frames)")
 
     win = st.session_state["window"]
     n = win["sy"].shape[0]
@@ -301,9 +408,10 @@ with col_stage:
             fd, clip_path = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             p = subprocess.run(
-                ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
-                 "-s", f"{win['w']}x{win['h']}", "-r", str(win["fps"]), "-i", "-",
-                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                ["ffmpeg", "-v", "error", "-y", "-threads", "2", "-f", "rawvideo",
+                 "-pix_fmt", "yuv420p", "-s", f"{win['w']}x{win['h']}", "-r", str(win["fps"]),
+                 "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-x264-params", "rc-lookahead=10:ref=1:bframes=0",
                  "-pix_fmt", "yuv420p", "-movflags", "+faststart", clip_path],
                 input=np.ascontiguousarray(out).tobytes(), capture_output=True)
             if p.returncode:
